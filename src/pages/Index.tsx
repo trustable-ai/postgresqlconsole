@@ -12,34 +12,14 @@ const Index = () => {
             />
           </div>
 
-          {/* Welcome Card */}
+          {/* Splash */}
           <div className="w-full animate-in fade-in slide-in-from-bottom-4 duration-700 delay-150">
-            <div className="rounded-2xl border bg-card p-8 shadow-elegant">
-              <h1 className="mb-2 text-2xl font-bold text-foreground">
-                Welcome
-              </h1>
-              <p className="mb-6 text-muted-foreground">
-                Try the following prompts to start
-              </p>
-
-              <ul className="space-y-3 text-base text-foreground">
-                <li>✅ Change the home page in a Todo list</li>
-                <li>📒 Change the home page in an Address book</li>
-                <li>⏱️ Change the home page in a Pomodoro timer</li>
-                <li>🧮 Change the home page in an Unit converter</li>
-              </ul>
-            </div>
+            <img
+              src="/splash.png"
+              alt="Splash"
+              className="w-full h-auto rounded-2xl"
+            />
           </div>
-
-          {/* Info Text */}
-          <p className="animate-in fade-in duration-1000 delay-300 text-center text-sm text-muted-foreground">
-            Powered by Trustable
-          </p>
-
-          {/* Upcoming Features */}
-          <p className="animate-in fade-in duration-1000 delay-500 text-center text-xs text-muted-foreground/70 max-w-sm">
-            Upcoming in next releases: full support for AI, databases (SQL, NoSQL, vector), Redis and S3 with serverless backend
-          </p>
         </div>
       </div>
     </div>
