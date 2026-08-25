@@ -16,6 +16,31 @@ export const STATUS_QUERY = `SELECT
     inet_server_addr() AS server_addr,
     inet_server_port() AS server_port;`;
 
+// Overview dashboard: safe runtime stats in a single row.
+export const STATS_QUERY = `SELECT
+    version() AS version,
+    current_database() AS database,
+    current_user AS current_user,
+    pg_postmaster_start_time() AS server_start,
+    (now() - pg_postmaster_start_time())::text AS uptime,
+    pg_size_pretty(pg_database_size(current_database())) AS db_size_pretty,
+    pg_database_size(current_database()) AS db_size_bytes,
+    (SELECT count(*) FROM pg_catalog.pg_namespace n
+       WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema') AS schema_count,
+    (SELECT count(*) FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relkind = 'r' AND n.nspname NOT LIKE 'pg\\_%') AS table_count,
+    (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname = current_database()) AS active_connections,
+    current_setting('max_connections')::int AS max_connections,
+    s.xact_commit AS transactions_committed,
+    s.xact_rollback AS transactions_rolled_back,
+    CASE WHEN (s.blks_hit + s.blks_read) = 0 THEN NULL
+         ELSE round(s.blks_hit::numeric / (s.blks_hit + s.blks_read), 4) END AS cache_hit_ratio,
+    s.blks_hit AS blocks_hit,
+    s.blks_read AS blocks_read
+FROM pg_catalog.pg_stat_database s
+WHERE s.datname = current_database();`;
+
 export const SCHEMAS_QUERY = `SELECT
     n.nspname AS schema_name,
     pg_catalog.pg_get_userbyid(n.nspowner) AS owner,
@@ -129,69 +154,143 @@ ORDER BY p.proname;`;
 
 export const ACTIVITY_QUERY = `SELECT
     pid,
-    usename AS "user",
     datname AS database,
-    application_name,
+    usename AS "user",
+    application_name AS application,
     client_addr,
     state,
     query_start,
-    state_change,
+    (now() - query_start)::text AS duration,
+    wait_event_type,
+    wait_event,
     LEFT(query, 120) AS query_preview
 FROM pg_catalog.pg_stat_activity
 WHERE datname IS NOT NULL
 ORDER BY query_start DESC NULLS LAST
 LIMIT 50;`;
 
-export function explainQuery(sql: string, analyze: boolean): string {
+export type ExplainFormat = "text" | "json";
+
+export function explainQuery(sql: string, format: ExplainFormat, analyze: boolean): string {
+  // Prefer EXPLAIN (FORMAT JSON) for initial inspection. ANALYZE actually
+  // executes the statement, so it is opt-in and never applied to writes here.
   const opts = analyze
-    ? "(ANALYZE, BUFFERS, FORMAT TEXT)"
-    : "(FORMAT TEXT)";
+    ? "(ANALYZE, BUFFERS, FORMAT " + format.toUpperCase() + ")"
+    : "(FORMAT " + format.toUpperCase() + ")";
   return `EXPLAIN ${opts}\n${sql.trim()}`;
 }
 
-export const EXAMPLES: { title: string; description: string; sql: string }[] = [
+export interface Example {
+  title: string;
+  description: string;
+  sql: string;
+  note?: string;
+}
+
+export const EXAMPLES: Example[] = [
   {
-    title: "Server identity",
-    description: "PostgreSQL version, database and current user.",
-    sql: `SELECT
-    version() AS version,
-    current_database() AS database,
-    current_user AS "user";`,
+    title: "SELECT",
+    description: "Project columns from the demo table.",
+    sql: `SELECT id, name, email, balance\nFROM pg_console_demo\nORDER BY id;`,
   },
   {
-    title: "List schemas",
-    description: "All non-system schemas in this database.",
-    sql: `SELECT n.nspname AS schema_name,
-       pg_catalog.pg_get_userbyid(n.nspowner) AS owner
-FROM pg_catalog.pg_namespace n
-WHERE n.nspname NOT LIKE 'pg\\_%'
-  AND n.nspname <> 'information_schema'
-ORDER BY n.nspname;`,
+    title: "WHERE",
+    description: "Filter rows with a predicate.",
+    sql: `SELECT id, name, balance\nFROM pg_console_demo\nWHERE balance >= 100\nORDER BY balance DESC;`,
   },
   {
-    title: "Table sizes",
-    description: "Top 20 tables by total size in the public schema.",
-    sql: `SELECT c.relname AS table_name,
-       pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
-       c.reltuples::bigint AS estimate_rows
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public' AND c.relkind = 'r'
-ORDER BY pg_total_relation_size(c.oid) DESC
-LIMIT 20;`,
+    title: "ORDER BY",
+    description: "Sort rows by one or more columns.",
+    sql: `SELECT name, balance\nFROM pg_console_demo\nORDER BY balance DESC, name ASC;`,
   },
   {
-    title: "Active connections",
-    description: "Currently running backend processes.",
-    sql: `SELECT pid, usename AS "user", datname AS database, state,
-       LEFT(query, 80) AS query_preview
-FROM pg_catalog.pg_stat_activity
-WHERE datname IS NOT NULL
-ORDER BY query_start DESC NULLS LAST;`,
+    title: "GROUP BY",
+    description: "Aggregate rows per group.",
+    sql: `SELECT (balance >= 100) AS high_balance,\n       count(*) AS cnt,\n       min(balance) AS min_bal,\n       max(balance) AS max_bal\nFROM pg_console_demo\nGROUP BY (balance >= 100)\nORDER BY high_balance;`,
   },
   {
-    title: "Row count demo",
-    description: "A simple computed row to confirm the console works.",
-    sql: `SELECT 1 AS one, 2 AS two, now() AS now;`,
+    title: "JOIN",
+    description: "Self-join to pair rows.",
+    sql: `SELECT a.name AS first, b.name AS second\nFROM pg_console_demo a\nJOIN pg_console_demo b ON a.id < b.id\nORDER BY a.id, b.id;`,
+  },
+  {
+    title: "CTE",
+    description: "Common table expression (WITH).",
+    sql: `WITH high AS (\n    SELECT name, balance FROM pg_console_demo WHERE balance >= 100\n)\nSELECT name, balance FROM high\nORDER BY balance DESC;`,
+  },
+  {
+    title: "Recursive CTE",
+    description: "A recursive countdown using WITH RECURSIVE.",
+    sql: `WITH RECURSIVE countdown(n) AS (\n    SELECT 5\n    UNION ALL\n    SELECT n - 1 FROM countdown WHERE n > 1\n)\nSELECT n FROM countdown ORDER BY n;`,
+  },
+  {
+    title: "Window functions",
+    description: "Rank rows without collapsing them.",
+    sql: `SELECT name, balance,\n       rank() OVER (ORDER BY balance DESC) AS rank_desc,\n       sum(balance) OVER () AS total\nFROM pg_console_demo\nORDER BY rank_desc;`,
+  },
+  {
+    title: "INSERT",
+    description: "Insert a row (WRITE — modifies the demo table).",
+    sql: `INSERT INTO pg_console_demo(id, name, email, balance)\nVALUES (90, 'Demo', 'demo@example.com', 5);`,
+    note: "WRITE",
+  },
+  {
+    title: "UPDATE",
+    description: "Update rows matching a predicate (WRITE).",
+    sql: `UPDATE pg_console_demo SET balance = balance + 1\nWHERE id = 1;`,
+    note: "WRITE",
+  },
+  {
+    title: "DELETE",
+    description: "Delete rows matching a predicate (WRITE).",
+    sql: `DELETE FROM pg_console_demo WHERE id = 90;`,
+    note: "WRITE",
+  },
+  {
+    title: "UPSERT",
+    description: "Insert, and on conflict update (WRITE).",
+    sql: `INSERT INTO pg_console_demo(id, name, email, balance)\nVALUES (1, 'Alice', 'alice@example.com', 150)\nON CONFLICT (id) DO UPDATE\n  SET balance = EXCLUDED.balance;`,
+    note: "WRITE",
+  },
+  {
+    title: "RETURNING",
+    description: "Return the affected rows (WRITE).",
+    sql: `UPDATE pg_console_demo SET balance = balance\nWHERE id = 1\nRETURNING id, name, balance;`,
+    note: "WRITE",
+  },
+  {
+    title: "JSON",
+    description: "Construct and access a json value.",
+    sql: `SELECT '{"name":"Alice","tags":["a","b"]}'::json AS j,\n       ('{"name":"Alice"}'::json ->> 'name') AS name;`,
+  },
+  {
+    title: "JSONB",
+    description: "Binary JSON with indexing and containment.",
+    sql: `SELECT '{"name":"Alice","balance":100}'::jsonb AS jb,\n       ('{"name":"Alice","balance":100}'::jsonb ->> 'name') AS name,\n       ('{"name":"Alice"}'::jsonb <@ '{"name":"Alice","balance":100}'::jsonb) AS contained;`,
+  },
+  {
+    title: "Arrays",
+    description: "Construct and unnest arrays.",
+    sql: `SELECT ARRAY[1, 2, 3] AS arr,\n       array_length(ARRAY[1, 2, 3], 1) AS len,\n       unnest(ARRAY['x', 'y', 'z']) AS elem;`,
+  },
+  {
+    title: "generate_series",
+    description: "Generate a set of rows.",
+    sql: `SELECT generate_series(1, 5) AS n,\n       generate_series(1, 5) * 2 AS doubled;`,
+  },
+  {
+    title: "Transactions",
+    description: "Inspect a transaction setting (see the Transactions page for BEGIN/COMMIT/ROLLBACK/SAVEPOINT).",
+    sql: `SELECT current_setting('default_transaction_isolation') AS isolation,\n       current_setting('default_transaction_read_only') AS read_only;`,
+  },
+  {
+    title: "Indexes",
+    description: "List indexes on the demo table.",
+    sql: `SELECT indexname, indexdef\nFROM pg_indexes\nWHERE schemaname = current_schema() AND tablename = 'pg_console_demo'\nORDER BY indexname;`,
+  },
+  {
+    title: "EXPLAIN",
+    description: "Inspect the execution plan as JSON (see the Explain page for a visual plan).",
+    sql: `EXPLAIN (FORMAT JSON)\nSELECT * FROM pg_console_demo WHERE balance > 50;`,
   },
 ];
