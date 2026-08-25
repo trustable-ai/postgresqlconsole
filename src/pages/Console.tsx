@@ -25,6 +25,9 @@ import { useServerInfo } from "@/hooks/useServerInfo";
 import { formatSQL } from "@/lib/format";
 import { copyText } from "@/lib/clipboard";
 import { addHistory, clearHistory, loadHistory, type HistoryEntry } from "@/lib/history";
+import { classifyStatement, type Classification } from "@/lib/safety";
+import { SafetyBadge } from "@/components/SafetyBadge";
+import { DestructiveConfirm } from "@/components/DestructiveConfirm";
 import { cn } from "@/lib/utils";
 
 type Tab = "results" | "messages" | "error" | "execution";
@@ -43,14 +46,20 @@ export default function Console() {
   const [lastAt, setLastAt] = useState<number | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory());
   const [showHistory, setShowHistory] = useState(false);
+  const [pendingDestructive, setPendingDestructive] = useState<{ sql: string; cls: Classification } | null>(null);
 
-  const execute = (query: string) => {
+  const execute = (query: string, confirm = false) => {
     const trimmed = query.trim();
     if (!trimmed) return;
+    const cls = classifyStatement(trimmed);
+    if (cls.op === "DESTRUCTIVE" && !confirm) {
+      setPendingDestructive({ sql: trimmed, cls });
+      return;
+    }
     setRunning(true);
     setLastSql(trimmed);
     setLastAt(Date.now());
-    runQuery({ sql: trimmed, schema })
+    runQuery({ sql: trimmed, schema, confirmDestructive: confirm })
       .then((res) => {
         if (res.ok) {
           setData(res.data);
@@ -173,6 +182,18 @@ export default function Console() {
           onClose={() => setShowHistory(false)}
         />
       )}
+
+      <DestructiveConfirm
+        open={!!pendingDestructive}
+        classification={pendingDestructive?.cls ?? null}
+        sql={pendingDestructive?.sql ?? ""}
+        onCancel={() => setPendingDestructive(null)}
+        onConfirm={() => {
+          const p = pendingDestructive;
+          setPendingDestructive(null);
+          if (p) execute(p.sql, true);
+        }}
+      />
     </div>
   );
 }
@@ -248,6 +269,9 @@ function ResultArea({
               <Terminal className="size-3.5 text-primary" />
               {data.command || "—"}
             </span>
+            {data.operation && (
+              <SafetyBadge op={data.operation as never} label={data.operationLabel} />
+            )}
             <span className="inline-flex items-center gap-1 text-muted-foreground">
               <Hash className="size-3.5" />
               {data.rowCount} {data.columns.length > 0 ? "rows" : "affected"}

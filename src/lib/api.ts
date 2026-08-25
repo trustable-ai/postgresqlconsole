@@ -24,6 +24,8 @@ export interface QueryData {
   rowCount: number;
   command: string;
   durationMs: number;
+  operation?: string;
+  operationLabel?: string;
   notices?: Notice[];
 }
 
@@ -61,6 +63,7 @@ export interface RunQueryOptions {
   sql: string;
   params?: unknown[];
   schema?: string;
+  confirmDestructive?: boolean;
   signal?: AbortSignal;
 }
 
@@ -89,7 +92,7 @@ export async function runQuery(opts: RunQueryOptions): Promise<ApiResponse<Query
     res = await fetch("/api/my/v1/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sql, params, schema }),
+      body: JSON.stringify({ sql, params, schema, confirm_destructive: opts.confirmDestructive }),
       signal,
     });
   } catch (err) {
@@ -138,3 +141,63 @@ export const DEFAULT_QUERY = `SELECT
     version(),
     current_database(),
     current_user;`;
+
+// ---------------------------------------------------------------------------
+// Guided transactions (v1/transaction)
+// ---------------------------------------------------------------------------
+
+export interface TransactionStatement {
+  sql: string;
+  params?: unknown[];
+}
+
+export interface StmtResult {
+  sql: string;
+  operation: string;
+  operationLabel: string;
+  durationMs: number;
+  columns?: ResultColumn[];
+  rows?: Record<string, unknown>[];
+  rowCount?: number;
+  command?: string;
+  error?: ApiError;
+}
+
+export interface TransactionData {
+  results: StmtResult[];
+  committed: boolean;
+  rolledBack: boolean;
+  notices?: Notice[];
+}
+
+export interface RunTransactionOptions {
+  statements: TransactionStatement[];
+  commit: boolean;
+  confirmDestructive?: boolean;
+}
+
+export async function runTransaction(opts: RunTransactionOptions): Promise<ApiResponse<TransactionData>> {
+  let res: Response;
+  try {
+    res = await fetch("/api/my/v1/transaction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        statements: opts.statements,
+        commit: opts.commit,
+        confirm_destructive: opts.confirmDestructive,
+      }),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      data: null,
+      error: { type: "NetworkError", message: err instanceof Error ? err.message : "Network request failed" },
+    };
+  }
+  const data = await unwrap<TransactionData>(res);
+  if (!res.ok && data.ok) {
+    return { ok: false, data: null, error: { type: "HttpError", message: `Request failed: ${res.status}` } };
+  }
+  return data;
+}

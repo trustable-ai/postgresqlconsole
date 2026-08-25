@@ -150,6 +150,9 @@ def _scrub(text):
 
 
 def _error_payload(exc):
+    if isinstance(exc, SafetyError):
+        return {"type": "DestructiveOperation", "message": exc.message,
+                "operation": exc.operation, "label": exc.label}
     if isinstance(exc, ConfigurationError):
         return {"type": "ConfigurationError", "message": str(exc)}
 
@@ -300,6 +303,52 @@ def _notice(obj):
 
 
 # ---------------------------------------------------------------------------
+# Safety: statement classification + destructive-operation enforcement
+# ---------------------------------------------------------------------------
+
+class SafetyError(Exception):
+    def __init__(self, operation, label, message):
+        super().__init__(message)
+        self.operation = operation
+        self.label = label
+        self.message = message
+
+
+def _strip_sql(sql):
+    """Remove line/block comments and surrounding whitespace for classification."""
+    s = re.sub(r"--[^\n]*", "", sql)
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    return s.strip()
+
+
+def _classify_statement(sql):
+    """Classify a SQL statement as READ / WRITE / DDL / DESTRUCTIVE / CONTROL.
+
+    Returns (operation, label). Conservative: unknown verbs default to WRITE.
+    Destructive: DROP, TRUNCATE, DELETE without WHERE, UPDATE without WHERE.
+    """
+    s = _strip_sql(sql)
+    if not s:
+        return "READ", "empty"
+    first = s.split(None, 1)[0].upper().rstrip(";")
+    if first in ("SELECT", "WITH", "VALUES", "TABLE", "SHOW", "EXPLAIN", "FETCH"):
+        return "READ", first
+    if first in ("INSERT", "UPDATE", "DELETE", "MERGE", "COPY"):
+        if first in ("UPDATE", "DELETE") and not re.search(r"\bWHERE\b", s, re.I):
+            return "DESTRUCTIVE", "%s without WHERE" % first
+        return "WRITE", first
+    if first in ("DROP", "TRUNCATE"):
+        return "DESTRUCTIVE", first
+    if first in ("CREATE", "ALTER", "GRANT", "REVOKE", "COMMENT", "REINDEX",
+                 "VACUUM", "ANALYZE", "CLUSTER", "REFRESH", "ATTACH", "DETACH"):
+        return "DDL", first
+    if first in ("BEGIN", "START", "COMMIT", "END", "ROLLBACK", "SAVEPOINT",
+                 "RELEASE", "SET", "RESET", "DISCARD", "LOCK"):
+        return "CONTROL", first
+    return "WRITE", first
+
+
+# ---------------------------------------------------------------------------
 # Request parsing
 # ---------------------------------------------------------------------------
 
@@ -329,7 +378,17 @@ def main(args, ctx=None):
 
     schema = (data.get("schema") or "").strip()
     params = data.get("params")
+    confirm_destructive = bool(data.get("confirm_destructive"))
     notices = []
+
+    operation, operation_label = _classify_statement(sql)
+    if operation == "DESTRUCTIVE" and not confirm_destructive:
+        return _fail_msg(
+            "DestructiveOperation",
+            "Destructive operation (%s) requires explicit confirmation.",
+            operation=operation,
+            label=operation_label,
+        )
 
     start = time.time()
     try:
@@ -364,6 +423,8 @@ def main(args, ctx=None):
                         "rowCount": len(rows),
                         "command": "SELECT",
                         "durationMs": duration,
+                        "operation": operation,
+                        "operationLabel": operation_label,
                         "notices": notices,
                     })
 
@@ -377,6 +438,8 @@ def main(args, ctx=None):
                     "rowCount": row_count,
                     "command": _command_from_status(status),
                     "durationMs": duration,
+                    "operation": operation,
+                    "operationLabel": operation_label,
                     "notices": notices,
                 })
     except Exception as exc:
