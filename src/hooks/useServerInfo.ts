@@ -6,6 +6,7 @@ export interface ServerInfo {
   version?: string;
   database?: string;
   user?: string;
+  sessionUser?: string;
   statementTimeoutMs?: number;
   error?: ApiError | null;
   loading: boolean;
@@ -32,6 +33,7 @@ export function useServerInfo(): ServerInfo & { refresh: () => void } {
           version: d.serverVersion,
           database: d.database,
           user: d.currentUser,
+          sessionUser: d.sessionUser,
           statementTimeoutMs: d.statementTimeoutMs,
         });
       })

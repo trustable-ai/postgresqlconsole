@@ -17,10 +17,13 @@ export const STATUS_QUERY = `SELECT
     inet_server_port() AS server_port;`;
 
 // Overview dashboard: safe runtime stats in a single row.
+// Shows only the currently configured identity (current_user, session_user,
+// current_database()) obtained from PostgreSQL — never a user selector.
 export const STATS_QUERY = `SELECT
     version() AS version,
     current_database() AS database,
     current_user AS current_user,
+    session_user AS session_user,
     pg_postmaster_start_time() AS server_start,
     (now() - pg_postmaster_start_time())::text AS uptime,
     pg_size_pretty(pg_database_size(current_database())) AS db_size_pretty,

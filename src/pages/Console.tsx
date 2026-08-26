@@ -25,7 +25,7 @@ import { useServerInfo } from "@/hooks/useServerInfo";
 import { formatSQL } from "@/lib/format";
 import { copyText } from "@/lib/clipboard";
 import { addHistory, clearHistory, loadHistory, type HistoryEntry } from "@/lib/history";
-import { classifyStatement, type Classification } from "@/lib/safety";
+import { classifyStatement, detectForbiddenIdentity, type Classification } from "@/lib/safety";
 import { SafetyBadge } from "@/components/SafetyBadge";
 import { DestructiveConfirm } from "@/components/DestructiveConfirm";
 import { cn } from "@/lib/utils";
@@ -52,6 +52,26 @@ export default function Console() {
     const trimmed = query.trim();
     if (!trimmed) return;
     const cls = classifyStatement(trimmed);
+    // User/role management and identity-switching commands are never allowed:
+    // the console operates as a single configured PostgreSQL user. Block them
+    // in the UI (the backend enforces the same rule independently).
+    if (cls.op === "FORBIDDEN") {
+      const label = detectForbiddenIdentity(trimmed) ?? "identity operation";
+      setError({
+        type: "ForbiddenIdentityOperation",
+        message: `User/role management and identity-switching commands are not allowed (${label}). The console operates as a single configured PostgreSQL user.`,
+      });
+      setData(null);
+      setTab("error");
+      setRunning(false);
+      setLastSql(trimmed);
+      setLastAt(Date.now());
+      setHistory(addHistory(trimmed, null, {
+        type: "ForbiddenIdentityOperation",
+        message: `Forbidden identity operation: ${label}`,
+      }));
+      return;
+    }
     if (cls.op === "DESTRUCTIVE" && !confirm) {
       setPendingDestructive({ sql: trimmed, cls });
       return;

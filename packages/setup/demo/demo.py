@@ -60,6 +60,12 @@ def _conn_kwargs(args):
     user = os.getenv("POSTGRES_USER")
     password = os.getenv("POSTGRES_PASSWORD")
     sslmode = os.getenv("POSTGRES_SSLMODE")
+    # Connection credentials come ONLY from the backend. The platform binds a
+    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
+    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
+    # reading it here is safe and the browser can never choose a different
+    # identity. Individual POSTGRES_* env vars are preferred when the user
+    # configures them in the app environment.
     if not host and not dbname:
         url = os.getenv("POSTGRES_URL")
         if not url and isinstance(args, dict):

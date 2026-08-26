@@ -11,6 +11,7 @@ interface Stats {
   version: string;
   database: string;
   current_user: string;
+  session_user: string;
   server_start: string;
   uptime: string;
   db_size_pretty: string;
@@ -81,6 +82,7 @@ export default function Overview() {
           <Stat icon={Server} label="Version" value={shortVersion(stats.version)} />
           <Stat icon={Database} label="Database" value={stats.database} />
           <Stat icon={User} label="Current user" value={stats.current_user} />
+          <Stat icon={User} label="Session user" value={stats.session_user} />
           <Stat icon={Clock} label="Server uptime" value={stats.uptime} />
           <Stat icon={HardDrive} label="Database size" value={stats.db_size_pretty} />
           <Stat icon={Boxes} label="Schemas" value={String(stats.schema_count)} />

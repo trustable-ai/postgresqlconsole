@@ -34,6 +34,7 @@ export interface HealthData {
   database?: string;
   serverVersion?: string;
   currentUser?: string;
+  sessionUser?: string;
   serverAddr?: string | null;
   serverPort?: number | null;
   statementTimeoutMs?: number;

@@ -78,6 +78,12 @@ def _conn_kwargs(args):
     password = os.getenv("POSTGRES_PASSWORD")
     sslmode = os.getenv("POSTGRES_SSLMODE")
 
+    # Connection credentials come ONLY from the backend. The platform binds a
+    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
+    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
+    # reading it here is safe and the browser can never choose a different
+    # identity. Individual POSTGRES_* env vars are preferred when the user
+    # configures them in the app environment.
     if not host and not dbname:
         url = os.getenv("POSTGRES_URL")
         if not url and isinstance(args, dict):
@@ -225,17 +231,18 @@ def main(args, ctx=None):
     try:
         with _connect(args) as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT version(), current_database(), current_user, "
+                "SELECT version(), current_database(), current_user, session_user, "
                 "inet_server_addr(), inet_server_port()"
             )
-            row = cur.fetchone() or (None, None, None, None, None)
+            row = cur.fetchone() or (None, None, None, None, None, None)
         return _ok({
             "connected": True,
             "database": row[1],
             "serverVersion": _short_version(row[0]),
             "currentUser": row[2],
-            "serverAddr": str(row[3]) if row[3] is not None else None,
-            "serverPort": row[4],
+            "sessionUser": row[3],
+            "serverAddr": str(row[4]) if row[4] is not None else None,
+            "serverPort": row[5],
             "statementTimeoutMs": _statement_timeout_ms(),
         })
     except Exception as exc:

@@ -86,6 +86,12 @@ def _conn_kwargs(args):
     user = os.getenv("POSTGRES_USER")
     password = os.getenv("POSTGRES_PASSWORD")
     sslmode = os.getenv("POSTGRES_SSLMODE")
+    # Connection credentials come ONLY from the backend. The platform binds a
+    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
+    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
+    # reading it here is safe and the browser can never choose a different
+    # identity. Individual POSTGRES_* env vars are preferred when the user
+    # configures them in the app environment.
     if not host and not dbname:
         url = os.getenv("POSTGRES_URL")
         if not url and isinstance(args, dict):
@@ -217,7 +223,11 @@ def _request_data(args):
         except Exception:
             body = {}
     merged = dict(body) if isinstance(body, dict) else {}
-    ignored = {"body", "__ow_method", "__ow_headers", "__ow_path", "POSTGRES_URL"}
+    ignored = {
+        "body", "__ow_method", "__ow_headers", "__ow_path",
+        "POSTGRES_URL", "user", "username", "role", "password",
+        "connection_string", "connstring", "dsn",
+    }
     merged.update({k: v for k, v in data.items() if k not in ignored})
     return merged
 

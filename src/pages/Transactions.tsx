@@ -5,7 +5,7 @@ import { ErrorPanel } from "@/components/useQuery";
 import { SafetyBadge } from "@/components/SafetyBadge";
 import { DestructiveConfirm } from "@/components/DestructiveConfirm";
 import { ResultTable } from "@/components/ResultTable";
-import { classifyStatement, findDestructive, type Classification } from "@/lib/safety";
+import { classifyStatement, findDestructive, detectForbiddenIdentity, type Classification } from "@/lib/safety";
 import { useServerInfo } from "@/hooks/useServerInfo";
 import { cn } from "@/lib/utils";
 
@@ -106,6 +106,19 @@ export default function Transactions() {
       setError({ type: "BadRequest", message: built });
       setResult(null);
       return;
+    }
+    // Block user/role management and identity-switching commands in the UI
+    // (the backend enforces the same rule independently).
+    for (let i = 0; i < built.length; i++) {
+      const fb = detectForbiddenIdentity(built[i].sql);
+      if (fb) {
+        setError({
+          type: "ForbiddenIdentityOperation",
+          message: `Statement ${i + 1} is a forbidden user/role management or identity-switching command (${fb}). The console operates as a single configured PostgreSQL user.`,
+        });
+        setResult(null);
+        return;
+      }
     }
     const dest = findDestructive(built);
     if (dest && !confirm) {

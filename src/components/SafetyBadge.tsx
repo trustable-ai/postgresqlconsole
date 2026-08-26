@@ -7,6 +7,7 @@ const STYLES: Record<OperationClass, string> = {
   DDL: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300",
   DESTRUCTIVE: "bg-rose-100 text-rose-700 dark:bg-rose-900/50 dark:text-rose-300",
   CONTROL: "bg-muted text-muted-foreground",
+  FORBIDDEN: "bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300",
 };
 
 const ICONS: Record<OperationClass, string> = {
@@ -15,6 +16,7 @@ const ICONS: Record<OperationClass, string> = {
   DDL: "🛠️",
   DESTRUCTIVE: "⚠️",
   CONTROL: "⚙️",
+  FORBIDDEN: "🚫",
 };
 
 export function SafetyBadge({ op, label }: { op: OperationClass; label?: string }) {
