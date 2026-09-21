@@ -2,10 +2,9 @@
 
 Returns safe connection status information using psycopg v3.
 
-Connection configuration is read from backend environment variables
-(``POSTGRES_HOST``, ``POSTGRES_PORT``, ``POSTGRES_DB``, ``POSTGRES_USER``,
-``POSTGRES_PASSWORD``, ``POSTGRES_SSLMODE``) with a fallback to the
-platform-bound ``POSTGRES_URL``. No secrets are exposed to the frontend.
+The connection is supplied by the generated wrapper as ``ctx.POSTGRESQL``,
+built from the platform-bound ``EXT_POSTGRES_URL``. This module never reads
+connection settings itself. No secrets are exposed to the frontend.
 
 Response envelope::
 
@@ -21,7 +20,6 @@ On failure::
 
 import os
 import re
-from urllib.parse import urlparse, unquote, parse_qs
 
 import psycopg
 from psycopg import errors as pg_errors
@@ -44,81 +42,8 @@ def _statement_timeout_ms():
         return DEFAULT_STATEMENT_TIMEOUT_MS
 
 
-def _parse_pg_url(url):
-    info = {}
-    try:
-        p = urlparse(url)
-    except Exception:
-        return info
-    if p.hostname:
-        info["host"] = p.hostname
-    if p.port:
-        info["port"] = str(p.port)
-    path = p.path or ""
-    if path.startswith("/"):
-        db = path[1:]
-        if db:
-            info["dbname"] = db
-    if p.username:
-        info["user"] = unquote(p.username)
-    if p.password:
-        info["password"] = unquote(p.password)
-    if p.query:
-        qs = parse_qs(p.query)
-        if "sslmode" in qs and qs["sslmode"]:
-            info["sslmode"] = qs["sslmode"][0]
-    return info
-
-
-def _conn_kwargs(args):
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB") or os.getenv("POSTGRES_DATABASE")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    sslmode = os.getenv("POSTGRES_SSLMODE")
-
-    # Connection credentials come ONLY from the backend. The platform binds a
-    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
-    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
-    # reading it here is safe and the browser can never choose a different
-    # identity. Individual POSTGRES_* env vars are preferred when the user
-    # configures them in the app environment.
-    if not host and not dbname:
-        url = os.getenv("POSTGRES_URL")
-        if not url and isinstance(args, dict):
-            url = args.get("POSTGRES_URL")
-        if url:
-            parsed = _parse_pg_url(url)
-            host = host or parsed.get("host")
-            port = port or parsed.get("port")
-            dbname = dbname or parsed.get("dbname")
-            user = user or parsed.get("user")
-            password = password or parsed.get("password")
-            sslmode = sslmode or parsed.get("sslmode")
-
-    kwargs = {
-        "host": host,
-        "port": port,
-        "dbname": dbname,
-        "user": user,
-        "password": password,
-        "sslmode": sslmode,
-        "connect_timeout": 5,
-    }
-    return {k: v for k, v in kwargs.items() if v is not None}
-
-
 class ConfigurationError(Exception):
     """Raised when required connection settings are missing."""
-
-
-def _connect(args):
-    kwargs = _conn_kwargs(args)
-    if not (kwargs.get("host") or kwargs.get("dbname")) and not kwargs.get("user"):
-        raise ConfigurationError("PostgreSQL connection not configured")
-    kwargs["options"] = "-c statement_timeout=%d" % _statement_timeout_ms()
-    return psycopg.connect(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +145,19 @@ def _fail(exc):
 # Main
 # ---------------------------------------------------------------------------
 
+def _rollback(conn):
+    """Reset a borrowed connection after a failure.
+
+    The connection belongs to the wrapper (``ctx.POSTGRESQL``) and is reused
+    across invocations in a warm container, so a failed request must not leave
+    it in an aborted transaction.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 def _short_version(version):
     if not version:
         return None
@@ -228,13 +166,20 @@ def _short_version(version):
 
 
 def main(args, ctx=None):
+    if ctx is None or getattr(ctx, "POSTGRESQL", None) is None:
+        return _fail(ConfigurationError("Database not configured"))
+    conn = ctx.POSTGRESQL
     try:
-        with _connect(args) as conn, conn.cursor() as cur:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = %d" % _statement_timeout_ms())
             cur.execute(
                 "SELECT version(), current_database(), current_user, session_user, "
                 "inet_server_addr(), inet_server_port()"
             )
             row = cur.fetchone() or (None, None, None, None, None, None)
+        # Close the read transaction so the borrowed connection is not
+        # left idle-in-transaction between invocations.
+        conn.commit()
         return _ok({
             "connected": True,
             "database": row[1],
@@ -246,4 +191,5 @@ def main(args, ctx=None):
             "statementTimeoutMs": _statement_timeout_ms(),
         })
     except Exception as exc:
+        _rollback(conn)
         return _fail(exc)

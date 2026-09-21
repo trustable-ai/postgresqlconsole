@@ -25,7 +25,6 @@ import json
 import os
 import re
 import uuid
-from urllib.parse import urlparse, unquote, parse_qs
 
 import psycopg
 from psycopg import errors as pg_errors
@@ -39,7 +38,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
-# Connection configuration
+# Statement timeout
 # ---------------------------------------------------------------------------
 
 def _statement_timeout_ms():
@@ -53,72 +52,8 @@ def _statement_timeout_ms():
         return DEFAULT_STATEMENT_TIMEOUT_MS
 
 
-def _parse_pg_url(url):
-    info = {}
-    try:
-        p = urlparse(url)
-    except Exception:
-        return info
-    if p.hostname:
-        info["host"] = p.hostname
-    if p.port:
-        info["port"] = str(p.port)
-    path = p.path or ""
-    if path.startswith("/"):
-        db = path[1:]
-        if db:
-            info["dbname"] = db
-    if p.username:
-        info["user"] = unquote(p.username)
-    if p.password:
-        info["password"] = unquote(p.password)
-    if p.query:
-        qs = parse_qs(p.query)
-        if "sslmode" in qs and qs["sslmode"]:
-            info["sslmode"] = qs["sslmode"][0]
-    return info
-
-
-def _conn_kwargs(args):
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB") or os.getenv("POSTGRES_DATABASE")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    sslmode = os.getenv("POSTGRES_SSLMODE")
-    # Connection credentials come ONLY from the backend. The platform binds a
-    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
-    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
-    # reading it here is safe and the browser can never choose a different
-    # identity. Individual POSTGRES_* env vars are preferred when the user
-    # configures them in the app environment.
-    if not host and not dbname:
-        url = os.getenv("POSTGRES_URL")
-        if not url and isinstance(args, dict):
-            url = args.get("POSTGRES_URL")
-        if url:
-            p = _parse_pg_url(url)
-            host = host or p.get("host")
-            port = port or p.get("port")
-            dbname = dbname or p.get("dbname")
-            user = user or p.get("user")
-            password = password or p.get("password")
-            sslmode = sslmode or p.get("sslmode")
-    kwargs = {"host": host, "port": port, "dbname": dbname, "user": user,
-              "password": password, "sslmode": sslmode, "connect_timeout": 5}
-    return {k: v for k, v in kwargs.items() if v is not None}
-
-
 class ConfigurationError(Exception):
     pass
-
-
-def _connect(args):
-    kwargs = _conn_kwargs(args)
-    if not (kwargs.get("host") or kwargs.get("dbname")) and not kwargs.get("user"):
-        raise ConfigurationError("PostgreSQL connection not configured")
-    kwargs["options"] = "-c statement_timeout=%d" % _statement_timeout_ms()
-    return psycopg.connect(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +116,19 @@ def _error_payload(exc):
 
 def _fail(exc):
     return {"ok": False, "data": None, "error": _error_payload(exc)}
+
+
+def _rollback(conn):
+    """Reset a borrowed connection after a failure.
+
+    The connection belongs to the wrapper (``ctx.POSTGRESQL``) and is reused
+    across invocations in a warm container, so a failed request must not leave
+    it in an aborted transaction.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 def _cell(value):
@@ -330,96 +278,104 @@ def main(args, ctx=None):
     if page < 0:
         page = 0
 
+    if ctx is None or getattr(ctx, "POSTGRESQL", None) is None:
+        return _fail(ConfigurationError("Database not configured"))
+    conn = ctx.POSTGRESQL
     try:
-        with _connect(args) as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Column names of the table.
-                cur.execute(_COLUMN_NAMES_SQL, (schema, table))
-                col_names = [r["name"] for r in cur.fetchall()]
-                if not col_names:
-                    return _fail_msg("NotFound", "Table not found or has no columns")
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SET statement_timeout = %d" % _statement_timeout_ms())
+            # 1. Column names of the table.
+            cur.execute(_COLUMN_NAMES_SQL, (schema, table))
+            col_names = [r["name"] for r in cur.fetchall()]
+            if not col_names:
+                return _fail_msg("NotFound", "Table not found or has no columns")
 
-                # 2. Primary key columns.
-                cur.execute(_PK_COLUMNS_SQL, (schema, table))
-                pk_cols = [r["name"] for r in cur.fetchall()]
+            # 2. Primary key columns.
+            cur.execute(_PK_COLUMNS_SQL, (schema, table))
+            pk_cols = [r["name"] for r in cur.fetchall()]
 
-                # 3. Resolve the ordering column + keyset eligibility.
+            # 3. Resolve the ordering column + keyset eligibility.
+            keyset = False
+            if explicit_order:
+                if explicit_order not in col_names:
+                    return _fail_msg("BadRequest", "order column does not exist in table")
+                order_col = explicit_order
+                keyset = (explicit_order in pk_cols and len(pk_cols) == 1)
+                if not keyset:
+                    cur.execute(_UNIQUE_NOTNULL_SQL, (schema, table, explicit_order))
+                    keyset = bool(cur.fetchone()["ok"])
+            elif len(pk_cols) == 1:
+                order_col = pk_cols[0]
+                keyset = True
+            else:
+                order_col = col_names[0]
                 keyset = False
-                if explicit_order:
-                    if explicit_order not in col_names:
-                        return _fail_msg("BadRequest", "order column does not exist in table")
-                    order_col = explicit_order
-                    keyset = (explicit_order in pk_cols and len(pk_cols) == 1)
-                    if not keyset:
-                        cur.execute(_UNIQUE_NOTNULL_SQL, (schema, table, explicit_order))
-                        keyset = bool(cur.fetchone()["ok"])
-                elif len(pk_cols) == 1:
-                    order_col = pk_cols[0]
-                    keyset = True
-                else:
-                    order_col = col_names[0]
-                    keyset = False
 
-                # 4. Total row estimate (for display).
-                cur.execute(_TOTAL_ESTIMATE_SQL, (schema, table))
-                total_est = cur.fetchone()
-                total_estimate = int(total_est["estimate"]) if total_est else None
+            # 4. Total row estimate (for display).
+            cur.execute(_TOTAL_ESTIMATE_SQL, (schema, table))
+            total_est = cur.fetchone()
+            total_estimate = int(total_est["estimate"]) if total_est else None
 
-                # 5. Build the paginated query with sql.Identifier composition.
-                base = sql.SQL("SELECT * FROM {tbl}").format(
-                    tbl=sql.Identifier(schema, table)
-                )
-                col_ident = sql.Identifier(order_col)
+            # 5. Build the paginated query with sql.Identifier composition.
+            base = sql.SQL("SELECT * FROM {tbl}").format(
+                tbl=sql.Identifier(schema, table)
+            )
+            col_ident = sql.Identifier(order_col)
 
-                if keyset:
-                    if cursor is not None and cursor != "":
-                        query = sql.SQL("{base} WHERE {col} > %s ORDER BY {col} LIMIT %s").format(
-                            base=base, col=col_ident
-                        )
-                        params = [cursor, limit]
-                    else:
-                        query = sql.SQL("{base} ORDER BY {col} LIMIT %s").format(
-                            base=base, col=col_ident
-                        )
-                        params = [limit]
-                else:
-                    offset = page * limit
-                    query = sql.SQL("{base} ORDER BY {col} LIMIT %s OFFSET %s").format(
+            if keyset:
+                if cursor is not None and cursor != "":
+                    query = sql.SQL("{base} WHERE {col} > %s ORDER BY {col} LIMIT %s").format(
                         base=base, col=col_ident
                     )
-                    params = [limit, offset]
+                    params = [cursor, limit]
+                else:
+                    query = sql.SQL("{base} ORDER BY {col} LIMIT %s").format(
+                        base=base, col=col_ident
+                    )
+                    params = [limit]
+            else:
+                offset = page * limit
+                query = sql.SQL("{base} ORDER BY {col} LIMIT %s OFFSET %s").format(
+                    base=base, col=col_ident
+                )
+                params = [limit, offset]
 
-                cur.execute(query, params)
-                description = cur.description
-                rows = _rows(cur.fetchall())
+            cur.execute(query, params)
+            description = cur.description
+            rows = _rows(cur.fetchall())
 
-                type_names = _resolve_type_names(conn, description)
-                columns_meta = [
-                    {"name": d.name, "type": type_names.get(d.type_code, "unknown")}
-                    for d in description
-                ] if description else [{"name": c, "type": "unknown"} for c in col_names]
+            type_names = _resolve_type_names(conn, description)
+            columns_meta = [
+                {"name": d.name, "type": type_names.get(d.type_code, "unknown")}
+                for d in description
+            ] if description else [{"name": c, "type": "unknown"} for c in col_names]
 
-                row_count = len(rows)
-                has_more = row_count == limit
-                next_cursor = None
-                if keyset and has_more and rows:
-                    next_cursor = rows[-1].get(order_col)
+            row_count = len(rows)
+            has_more = row_count == limit
+            next_cursor = None
+            if keyset and has_more and rows:
+                next_cursor = rows[-1].get(order_col)
 
-                return _ok({
-                    "schema": schema,
-                    "table": table,
-                    "columns": columns_meta,
-                    "rows": rows,
-                    "rowCount": row_count,
-                    "pagination": {
-                        "mode": "keyset" if keyset else "offset",
-                        "order": order_col,
-                        "limit": limit,
-                        "page": page if not keyset else None,
-                        "hasMore": has_more,
-                        "nextCursor": next_cursor,
-                        "totalEstimate": total_estimate,
-                    },
-                })
+            return _ok({
+                "schema": schema,
+                "table": table,
+                "columns": columns_meta,
+                "rows": rows,
+                "rowCount": row_count,
+                "pagination": {
+                    "mode": "keyset" if keyset else "offset",
+                    "order": order_col,
+                    "limit": limit,
+                    "page": page if not keyset else None,
+                    "hasMore": has_more,
+                    "nextCursor": next_cursor,
+                    "totalEstimate": total_estimate,
+                },
+            })
     except Exception as exc:
+        _rollback(conn)
         return _fail(exc)
+    finally:
+        # This action only reads. Whether it returned a page, a BadRequest or
+        # raised, the borrowed connection must not be left idle-in-transaction.
+        _rollback(conn)

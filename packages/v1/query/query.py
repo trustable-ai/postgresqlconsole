@@ -3,11 +3,10 @@
 Executes a SQL string from the React UI against PostgreSQL using psycopg v3
 (``import psycopg`` — never psycopg2).
 
-Connection configuration is read from backend environment variables
-(``POSTGRES_HOST``, ``POSTGRES_PORT``, ``POSTGRES_DB``, ``POSTGRES_USER``,
-``POSTGRES_PASSWORD``, ``POSTGRES_SSLMODE``) and falls back to parsing the
-``POSTGRES_URL`` that the platform binds. Connection strings / passwords are
-never exposed to the frontend.
+The connection is supplied by the generated wrapper as ``ctx.POSTGRESQL``,
+built from the platform-bound ``EXT_POSTGRES_URL``. This module never reads
+connection settings itself. Connection strings / passwords are never exposed
+to the frontend.
 
 Rows are read with the ``dict_row`` row factory so results are returned as
 structured objects keyed by column name, with column type metadata resolved
@@ -31,7 +30,6 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import urlparse, unquote, parse_qs
 
 import psycopg
 from psycopg import errors as pg_errors
@@ -56,81 +54,8 @@ def _statement_timeout_ms():
         return DEFAULT_STATEMENT_TIMEOUT_MS
 
 
-def _parse_pg_url(url):
-    info = {}
-    try:
-        p = urlparse(url)
-    except Exception:
-        return info
-    if p.hostname:
-        info["host"] = p.hostname
-    if p.port:
-        info["port"] = str(p.port)
-    path = p.path or ""
-    if path.startswith("/"):
-        db = path[1:]
-        if db:
-            info["dbname"] = db
-    if p.username:
-        info["user"] = unquote(p.username)
-    if p.password:
-        info["password"] = unquote(p.password)
-    if p.query:
-        qs = parse_qs(p.query)
-        if "sslmode" in qs and qs["sslmode"]:
-            info["sslmode"] = qs["sslmode"][0]
-    return info
-
-
-def _conn_kwargs(args):
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB") or os.getenv("POSTGRES_DATABASE")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    sslmode = os.getenv("POSTGRES_SSLMODE")
-
-    # Connection credentials come ONLY from the backend. The platform binds a
-    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
-    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
-    # reading it here is safe and the browser can never choose a different
-    # identity. Individual POSTGRES_* env vars are preferred when the user
-    # configures them in the app environment.
-    if not host and not dbname:
-        url = os.getenv("POSTGRES_URL")
-        if not url and isinstance(args, dict):
-            url = args.get("POSTGRES_URL")
-        if url:
-            parsed = _parse_pg_url(url)
-            host = host or parsed.get("host")
-            port = port or parsed.get("port")
-            dbname = dbname or parsed.get("dbname")
-            user = user or parsed.get("user")
-            password = password or parsed.get("password")
-            sslmode = sslmode or parsed.get("sslmode")
-
-    kwargs = {
-        "host": host,
-        "port": port,
-        "dbname": dbname,
-        "user": user,
-        "password": password,
-        "sslmode": sslmode,
-        "connect_timeout": 5,
-    }
-    return {k: v for k, v in kwargs.items() if v is not None}
-
-
 class ConfigurationError(Exception):
     """Raised when required connection settings are missing."""
-
-
-def _connect(args):
-    kwargs = _conn_kwargs(args)
-    if not (kwargs.get("host") or kwargs.get("dbname")) and not kwargs.get("user"):
-        raise ConfigurationError("PostgreSQL connection not configured")
-    kwargs["options"] = "-c statement_timeout=%d" % _statement_timeout_ms()
-    return psycopg.connect(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +146,19 @@ def _classify_connection_error(exc, message):
 
 def _fail(exc):
     return {"ok": False, "data": None, "error": _error_payload(exc)}
+
+
+def _rollback(conn):
+    """Reset a borrowed connection after a failure.
+
+    The connection belongs to the wrapper (``ctx.POSTGRESQL``) and is reused
+    across invocations in a warm container, so a failed request must not leave
+    it in an aborted transaction.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -470,57 +408,73 @@ def main(args, ctx=None):
             label=operation_label,
         )
 
+    if ctx is None or getattr(ctx, "POSTGRESQL", None) is None:
+        return _fail(ConfigurationError("Database not configured"))
+    conn = ctx.POSTGRESQL
+
     start = time.time()
+    # The connection is borrowed from the wrapper and outlives this call in a
+    # warm container, so the notice handler must be removed again afterwards.
+    handler = lambda d: notices.append(_notice(d))
+    conn.add_notice_handler(handler)
     try:
-        with _connect(args) as conn:
-            conn.add_notice_handler(lambda d: notices.append(_notice(d)))
-            with conn.cursor(row_factory=dict_row) as cur:
-                if schema:
-                    if not _SCHEMA_RE.match(schema):
-                        return _fail_msg("BadRequest", "Invalid schema name: %r" % (schema,))
-                    cur.execute('SET LOCAL search_path TO "%s"' % schema)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SET statement_timeout = %d" % _statement_timeout_ms())
+            if schema:
+                if not _SCHEMA_RE.match(schema):
+                    return _fail_msg("BadRequest", "Invalid schema name: %r" % (schema,))
+                cur.execute('SET LOCAL search_path TO "%s"' % schema)
 
-                if params is None:
-                    cur.execute(sql)
-                else:
-                    if not isinstance(params, list):
-                        return _fail_msg("BadRequest", "'params' must be a list")
-                    cur.execute(sql, params)
+            if params is None:
+                cur.execute(sql)
+            else:
+                if not isinstance(params, list):
+                    return _fail_msg("BadRequest", "'params' must be a list")
+                cur.execute(sql, params)
 
-                duration = int((time.time() - start) * 1000)
+            duration = int((time.time() - start) * 1000)
 
-                if cur.description is not None:
-                    desc = cur.description
-                    rows = _rows_to_json(cur.fetchall())
-                    type_names = _resolve_type_names(conn, desc)
-                    columns_meta = [
-                        {"name": c.name, "type": type_names.get(c.type_code, "unknown")}
-                        for c in desc
-                    ]
-                    return _ok({
-                        "columns": columns_meta,
-                        "rows": rows,
-                        "rowCount": len(rows),
-                        "command": "SELECT",
-                        "durationMs": duration,
-                        "operation": operation,
-                        "operationLabel": operation_label,
-                        "notices": notices,
-                    })
-
+            if cur.description is not None:
+                desc = cur.description
+                rows = _rows_to_json(cur.fetchall())
+                type_names = _resolve_type_names(conn, desc)
+                columns_meta = [
+                    {"name": c.name, "type": type_names.get(c.type_code, "unknown")}
+                    for c in desc
+                ]
+                # Close the read transaction so the borrowed connection is not
+                # left idle-in-transaction between invocations.
                 conn.commit()
-                status = getattr(cur, "statusmessage", "") or ""
-                rc = getattr(cur, "rowcount", -1)
-                row_count = rc if (rc is not None and rc >= 0) else 0
                 return _ok({
-                    "columns": [],
-                    "rows": [],
-                    "rowCount": row_count,
-                    "command": _command_from_status(status),
+                    "columns": columns_meta,
+                    "rows": rows,
+                    "rowCount": len(rows),
+                    "command": "SELECT",
                     "durationMs": duration,
                     "operation": operation,
                     "operationLabel": operation_label,
                     "notices": notices,
                 })
+
+            conn.commit()
+            status = getattr(cur, "statusmessage", "") or ""
+            rc = getattr(cur, "rowcount", -1)
+            row_count = rc if (rc is not None and rc >= 0) else 0
+            return _ok({
+                "columns": [],
+                "rows": [],
+                "rowCount": row_count,
+                "command": _command_from_status(status),
+                "durationMs": duration,
+                "operation": operation,
+                "operationLabel": operation_label,
+                "notices": notices,
+            })
     except Exception as exc:
+        _rollback(conn)
         return _fail(exc)
+    finally:
+        try:
+            conn.remove_notice_handler(handler)
+        except Exception:
+            pass

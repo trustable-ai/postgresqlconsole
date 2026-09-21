@@ -17,7 +17,6 @@ import json
 import os
 import re
 import uuid
-from urllib.parse import urlparse, unquote, parse_qs
 
 import psycopg
 from psycopg import errors as pg_errors
@@ -28,7 +27,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
-# Connection configuration (env vars, fallback to POSTGRES_URL)
+# Statement timeout
 # ---------------------------------------------------------------------------
 
 def _statement_timeout_ms():
@@ -42,72 +41,8 @@ def _statement_timeout_ms():
         return DEFAULT_STATEMENT_TIMEOUT_MS
 
 
-def _parse_pg_url(url):
-    info = {}
-    try:
-        p = urlparse(url)
-    except Exception:
-        return info
-    if p.hostname:
-        info["host"] = p.hostname
-    if p.port:
-        info["port"] = str(p.port)
-    path = p.path or ""
-    if path.startswith("/"):
-        db = path[1:]
-        if db:
-            info["dbname"] = db
-    if p.username:
-        info["user"] = unquote(p.username)
-    if p.password:
-        info["password"] = unquote(p.password)
-    if p.query:
-        qs = parse_qs(p.query)
-        if "sslmode" in qs and qs["sslmode"]:
-            info["sslmode"] = qs["sslmode"][0]
-    return info
-
-
-def _conn_kwargs(args):
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB") or os.getenv("POSTGRES_DATABASE")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    sslmode = os.getenv("POSTGRES_SSLMODE")
-    # Connection credentials come ONLY from the backend. The platform binds a
-    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
-    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
-    # reading it here is safe and the browser can never choose a different
-    # identity. Individual POSTGRES_* env vars are preferred when the user
-    # configures them in the app environment.
-    if not host and not dbname:
-        url = os.getenv("POSTGRES_URL")
-        if not url and isinstance(args, dict):
-            url = args.get("POSTGRES_URL")
-        if url:
-            p = _parse_pg_url(url)
-            host = host or p.get("host")
-            port = port or p.get("port")
-            dbname = dbname or p.get("dbname")
-            user = user or p.get("user")
-            password = password or p.get("password")
-            sslmode = sslmode or p.get("sslmode")
-    kwargs = {"host": host, "port": port, "dbname": dbname, "user": user,
-              "password": password, "sslmode": sslmode, "connect_timeout": 5}
-    return {k: v for k, v in kwargs.items() if v is not None}
-
-
 class ConfigurationError(Exception):
     pass
-
-
-def _connect(args):
-    kwargs = _conn_kwargs(args)
-    if not (kwargs.get("host") or kwargs.get("dbname")) and not kwargs.get("user"):
-        raise ConfigurationError("PostgreSQL connection not configured")
-    kwargs["options"] = "-c statement_timeout=%d" % _statement_timeout_ms()
-    return psycopg.connect(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +105,19 @@ def _error_payload(exc):
 
 def _fail(exc):
     return {"ok": False, "data": None, "error": _error_payload(exc)}
+
+
+def _rollback(conn):
+    """Reset a borrowed connection after a failure.
+
+    The connection belongs to the wrapper (``ctx.POSTGRESQL``) and is reused
+    across invocations in a warm container, so a failed request must not leave
+    it in an aborted transaction.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 def _cell(value):
@@ -328,22 +276,34 @@ _KIND_QUERIES = {
 def main(args, ctx=None):
     data = _request_data(args)
     op = (data.get("op") or "").strip()
+    if ctx is None or getattr(ctx, "POSTGRESQL", None) is None:
+        return _fail(ConfigurationError("Database not configured"))
+    conn = ctx.POSTGRESQL
     try:
-        with _connect(args) as conn, conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SET statement_timeout = %d" % _statement_timeout_ms())
             if op == "schemas":
                 cur.execute(_SCHEMAS_SQL)
-                return _ok({"schemas": _rows(cur.fetchall())})
+                result = _ok({"schemas": _rows(cur.fetchall())})
 
-            if op == "objects":
+            elif op == "objects":
                 kind = (data.get("kind") or "").strip()
                 schema = (data.get("schema") or "").strip()
                 if kind not in _KIND_QUERIES:
-                    return _fail_msg("BadRequest", "Unknown object kind: %r" % (kind,))
-                if not schema or not _IDENT_RE.match(schema):
-                    return _fail_msg("BadRequest", "Invalid or missing schema name")
-                cur.execute(_KIND_QUERIES[kind], (schema,))
-                return _ok({"kind": kind, "schema": schema, "objects": _rows(cur.fetchall())})
+                    result = _fail_msg("BadRequest", "Unknown object kind: %r" % (kind,))
+                elif not schema or not _IDENT_RE.match(schema):
+                    result = _fail_msg("BadRequest", "Invalid or missing schema name")
+                else:
+                    cur.execute(_KIND_QUERIES[kind], (schema,))
+                    result = _ok({"kind": kind, "schema": schema, "objects": _rows(cur.fetchall())})
 
-            return _fail_msg("BadRequest", "Unknown op: %r (expected 'schemas' or 'objects')" % (op,))
+            else:
+                result = _fail_msg("BadRequest", "Unknown op: %r (expected 'schemas' or 'objects')" % (op,))
+
+        # Close the read transaction so the borrowed connection is not
+        # left idle-in-transaction between invocations.
+        conn.commit()
+        return result
     except Exception as exc:
+        _rollback(conn)
         return _fail(exc)

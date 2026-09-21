@@ -25,7 +25,6 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import urlparse, unquote, parse_qs
 
 import psycopg
 from psycopg import errors as pg_errors
@@ -35,7 +34,7 @@ DEFAULT_STATEMENT_TIMEOUT_MS = 30000
 
 
 # ---------------------------------------------------------------------------
-# Connection configuration
+# Statement timeout
 # ---------------------------------------------------------------------------
 
 def _statement_timeout_ms():
@@ -49,72 +48,8 @@ def _statement_timeout_ms():
         return DEFAULT_STATEMENT_TIMEOUT_MS
 
 
-def _parse_pg_url(url):
-    info = {}
-    try:
-        p = urlparse(url)
-    except Exception:
-        return info
-    if p.hostname:
-        info["host"] = p.hostname
-    if p.port:
-        info["port"] = str(p.port)
-    path = p.path or ""
-    if path.startswith("/"):
-        db = path[1:]
-        if db:
-            info["dbname"] = db
-    if p.username:
-        info["user"] = unquote(p.username)
-    if p.password:
-        info["password"] = unquote(p.password)
-    if p.query:
-        qs = parse_qs(p.query)
-        if "sslmode" in qs and qs["sslmode"]:
-            info["sslmode"] = qs["sslmode"][0]
-    return info
-
-
-def _conn_kwargs(args):
-    host = os.getenv("POSTGRES_HOST")
-    port = os.getenv("POSTGRES_PORT")
-    dbname = os.getenv("POSTGRES_DB") or os.getenv("POSTGRES_DATABASE")
-    user = os.getenv("POSTGRES_USER")
-    password = os.getenv("POSTGRES_PASSWORD")
-    sslmode = os.getenv("POSTGRES_SSLMODE")
-    # Connection credentials come ONLY from the backend. The platform binds a
-    # final POSTGRES_URL secret to the action; OpenWhisk rejects any
-    # frontend-supplied POSTGRES_URL/user/password as a reserved property, so
-    # reading it here is safe and the browser can never choose a different
-    # identity. Individual POSTGRES_* env vars are preferred when the user
-    # configures them in the app environment.
-    if not host and not dbname:
-        url = os.getenv("POSTGRES_URL")
-        if not url and isinstance(args, dict):
-            url = args.get("POSTGRES_URL")
-        if url:
-            p = _parse_pg_url(url)
-            host = host or p.get("host")
-            port = port or p.get("port")
-            dbname = dbname or p.get("dbname")
-            user = user or p.get("user")
-            password = password or p.get("password")
-            sslmode = sslmode or p.get("sslmode")
-    kwargs = {"host": host, "port": port, "dbname": dbname, "user": user,
-              "password": password, "sslmode": sslmode, "connect_timeout": 5}
-    return {k: v for k, v in kwargs.items() if v is not None}
-
-
 class ConfigurationError(Exception):
     pass
-
-
-def _connect(args):
-    kwargs = _conn_kwargs(args)
-    if not (kwargs.get("host") or kwargs.get("dbname")) and not kwargs.get("user"):
-        raise ConfigurationError("PostgreSQL connection not configured")
-    kwargs["options"] = "-c statement_timeout=%d" % _statement_timeout_ms()
-    return psycopg.connect(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +108,19 @@ def _error_payload(exc):
             payload["sqlstate"] = sqlstate
         return payload
     return {"type": type(exc).__name__, "message": _scrub(str(exc))}
+
+
+def _rollback(conn):
+    """Reset a borrowed connection after a failure.
+
+    The connection belongs to the wrapper (``ctx.POSTGRESQL``) and is reused
+    across invocations in a warm container, so a failed request must not leave
+    it in an aborted transaction.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 def _cell(value):
@@ -393,63 +341,73 @@ def main(args, ctx=None):
     class _RollbackSignal(Exception):
         """Raised to make conn.transaction() roll back cleanly (commit=false)."""
 
-    try:
-        with _connect(args) as conn:
-            conn.add_notice_handler(lambda d: notices.append({
-                "severity": getattr(d, "severity", None),
-                "code": getattr(d, "sqlstate", None) or getattr(getattr(d, "diag", d), "sqlstate", None),
-                "message": (getattr(getattr(d, "diag", d), "message_primary", None) or "").strip(),
-            }))
-            try:
-                with conn.transaction():
-                    with conn.cursor(row_factory=dict_row) as cur:
-                        for stmt in statements:
-                            start = time.time()
-                            item = {
-                                "sql": stmt["sql"],
-                                "operation": stmt["operation"],
-                                "operationLabel": stmt["operationLabel"],
-                                "durationMs": 0,
-                            }
-                            try:
-                                if stmt["params"] is None:
-                                    cur.execute(stmt["sql"])
-                                else:
-                                    cur.execute(stmt["sql"], stmt["params"])
-                                item["durationMs"] = int((time.time() - start) * 1000)
-                                if cur.description is not None:
-                                    desc = cur.description
-                                    type_names = _resolve_type_names(conn, desc)
-                                    item["columns"] = [
-                                        {"name": c.name, "type": type_names.get(c.type_code, "unknown")}
-                                        for c in desc
-                                    ]
-                                    item["rows"] = _rows(cur.fetchall())
-                                    item["rowCount"] = len(item["rows"])
-                                    item["command"] = "SELECT"
-                                else:
-                                    rc = getattr(cur, "rowcount", -1)
-                                    item["rowCount"] = rc if (rc is not None and rc >= 0) else 0
-                                    item["command"] = _command_from_status(getattr(cur, "statusmessage", "") or "")
-                                results.append(item)
-                            except Exception as e:
-                                item["durationMs"] = int((time.time() - start) * 1000)
-                                item["error"] = _error_payload(e)
-                                results.append(item)
-                                stmt_failed = True
-                                raise  # conn.transaction() rolls back
-                    if not commit:
-                        raise _RollbackSignal()
-            except _RollbackSignal:
-                rolled_back = True
-            except Exception:
-                # A statement failed: the transaction context already rolled back.
-                if not stmt_failed:
-                    raise  # unexpected connection/transaction-level error
-                rolled_back = True
+    if ctx is None or getattr(ctx, "POSTGRESQL", None) is None:
+        return {"ok": False, "data": None,
+                "error": _error_payload(ConfigurationError("Database not configured"))}
+    conn = ctx.POSTGRESQL
 
-            if not stmt_failed and not rolled_back and commit:
-                committed = True
+    # The connection is borrowed from the wrapper and outlives this call in a
+    # warm container, so the notice handler must be removed again afterwards.
+    def handler(d):
+        notices.append({
+            "severity": getattr(d, "severity", None),
+            "code": getattr(d, "sqlstate", None) or getattr(getattr(d, "diag", d), "sqlstate", None),
+            "message": (getattr(getattr(d, "diag", d), "message_primary", None) or "").strip(),
+        })
+
+    conn.add_notice_handler(handler)
+    try:
+        try:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute("SET LOCAL statement_timeout = %d" % _statement_timeout_ms())
+                    for stmt in statements:
+                        start = time.time()
+                        item = {
+                            "sql": stmt["sql"],
+                            "operation": stmt["operation"],
+                            "operationLabel": stmt["operationLabel"],
+                            "durationMs": 0,
+                        }
+                        try:
+                            if stmt["params"] is None:
+                                cur.execute(stmt["sql"])
+                            else:
+                                cur.execute(stmt["sql"], stmt["params"])
+                            item["durationMs"] = int((time.time() - start) * 1000)
+                            if cur.description is not None:
+                                desc = cur.description
+                                type_names = _resolve_type_names(conn, desc)
+                                item["columns"] = [
+                                    {"name": c.name, "type": type_names.get(c.type_code, "unknown")}
+                                    for c in desc
+                                ]
+                                item["rows"] = _rows(cur.fetchall())
+                                item["rowCount"] = len(item["rows"])
+                                item["command"] = "SELECT"
+                            else:
+                                rc = getattr(cur, "rowcount", -1)
+                                item["rowCount"] = rc if (rc is not None and rc >= 0) else 0
+                                item["command"] = _command_from_status(getattr(cur, "statusmessage", "") or "")
+                            results.append(item)
+                        except Exception as e:
+                            item["durationMs"] = int((time.time() - start) * 1000)
+                            item["error"] = _error_payload(e)
+                            results.append(item)
+                            stmt_failed = True
+                            raise  # conn.transaction() rolls back
+                if not commit:
+                    raise _RollbackSignal()
+        except _RollbackSignal:
+            rolled_back = True
+        except Exception:
+            # A statement failed: the transaction context already rolled back.
+            if not stmt_failed:
+                raise  # unexpected connection/transaction-level error
+            rolled_back = True
+
+        if not stmt_failed and not rolled_back and commit:
+            committed = True
 
         return _ok({
             "results": results,
@@ -458,6 +416,7 @@ def main(args, ctx=None):
             "notices": notices,
         })
     except Exception as exc:
+        _rollback(conn)
         # If we already collected partial results, include them in the error.
         if results:
             return {
@@ -466,3 +425,8 @@ def main(args, ctx=None):
                 "error": _error_payload(exc),
             }
         return {"ok": False, "data": None, "error": _error_payload(exc)}
+    finally:
+        try:
+            conn.remove_notice_handler(handler)
+        except Exception:
+            pass
