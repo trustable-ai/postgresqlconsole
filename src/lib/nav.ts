@@ -3,7 +3,6 @@ import {
   LayoutDashboard,
   FolderTree,
   TerminalSquare,
-  Database,
   Boxes,
   Table2,
   Eye,
@@ -12,11 +11,9 @@ import {
   Link2,
   Hash,
   FunctionSquare,
-  Braces,
   ListChecks,
   ArrowLeftRight,
   GitBranch,
-  Activity,
   BookOpen,
 } from "lucide-react";
 
@@ -30,7 +27,6 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/overview", label: "Overview", icon: LayoutDashboard },
   { to: "/explorer", label: "Explorer", icon: FolderTree },
   { to: "/console", label: "SQL Console", icon: TerminalSquare },
-  { to: "/databases", label: "Databases", icon: Database },
   { to: "/schemas", label: "Schemas", icon: Boxes },
   { to: "/tables", label: "Tables", icon: Table2 },
   { to: "/views", label: "Views", icon: Eye },
@@ -40,9 +36,7 @@ export const NAV_ITEMS: NavItem[] = [
   { to: "/sequences", label: "Sequences", icon: Hash },
   { to: "/functions", label: "Functions", icon: FunctionSquare },
   { to: "/queries", label: "Queries", icon: ListChecks },
-  { to: "/params", label: "Parameterized", icon: Braces },
   { to: "/transactions", label: "Transactions", icon: ArrowLeftRight },
   { to: "/explain", label: "Explain", icon: GitBranch },
-  { to: "/activity", label: "Activity", icon: Activity },
   { to: "/examples", label: "Examples", icon: BookOpen },
 ];

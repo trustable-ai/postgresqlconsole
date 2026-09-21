@@ -53,16 +53,6 @@ WHERE n.nspname NOT LIKE 'pg\\_%'
   AND n.nspname <> 'information_schema'
 ORDER BY n.nspname;`;
 
-export const DATABASES_QUERY = `SELECT
-    d.datname AS database_name,
-    pg_catalog.pg_get_userbyid(d.datdba) AS owner,
-    pg_encoding_to_char(d.encoding) AS encoding,
-    pg_catalog.shobj_description(d.oid, 'pg_database') AS description,
-    d.datistemplate AS is_template,
-    d.datallowconn AS allow_conn
-FROM pg_catalog.pg_database d
-ORDER BY d.datname;`;
-
 export const TABLES_QUERY = (schema: string) => `SELECT
     c.relname AS table_name,
     pg_catalog.pg_get_userbyid(c.relowner) AS owner,
@@ -154,23 +144,6 @@ JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_language l ON l.oid = p.prolang
 WHERE n.nspname = '${schema}'
 ORDER BY p.proname;`;
-
-export const ACTIVITY_QUERY = `SELECT
-    pid,
-    datname AS database,
-    usename AS "user",
-    application_name AS application,
-    client_addr,
-    state,
-    query_start,
-    (now() - query_start)::text AS duration,
-    wait_event_type,
-    wait_event,
-    LEFT(query, 120) AS query_preview
-FROM pg_catalog.pg_stat_activity
-WHERE datname IS NOT NULL
-ORDER BY query_start DESC NULLS LAST
-LIMIT 50;`;
 
 export type ExplainFormat = "text" | "json";
 

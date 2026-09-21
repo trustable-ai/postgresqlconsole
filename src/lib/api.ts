@@ -62,7 +62,6 @@ export interface ApiResponse<T> {
 
 export interface RunQueryOptions {
   sql: string;
-  params?: unknown[];
   schema?: string;
   confirmDestructive?: boolean;
   signal?: AbortSignal;
@@ -87,13 +86,13 @@ async function unwrap<T>(res: Response): Promise<ApiResponse<T>> {
 }
 
 export async function runQuery(opts: RunQueryOptions): Promise<ApiResponse<QueryData>> {
-  const { sql, params, schema, signal } = opts;
+  const { sql, schema, signal } = opts;
   let res: Response;
   try {
     res = await fetch("/api/my/v1/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sql, params, schema, confirm_destructive: opts.confirmDestructive }),
+      body: JSON.stringify({ sql, schema, confirm_destructive: opts.confirmDestructive }),
       signal,
     });
   } catch (err) {

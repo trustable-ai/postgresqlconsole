@@ -47,43 +47,6 @@ export function useSchemaQuery(sqlFn: (schema: string) => string, schema: string
   return { data, error, loading, refresh: () => setNonce((n) => n + 1) };
 }
 
-export function useFixedQuery(sql: string): UseQueryState {
-  const [data, setData] = useState<QueryData | null>(null);
-  const [error, setError] = useState<ApiError | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [nonce, setNonce] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    runQuery({ sql })
-      .then((res) => {
-        if (cancelled) return;
-        if (res.ok) {
-          setData(res.data);
-          setError(null);
-        } else {
-          setData(null);
-          setError(res.error);
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setError({ type: "NetworkError", message: "Request failed" });
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sql, nonce]);
-
-  return { data, error, loading, refresh: () => setNonce((n) => n + 1) };
-}
-
 interface PageProps {
   title: string;
   description: string;

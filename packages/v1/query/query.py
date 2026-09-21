@@ -395,7 +395,6 @@ def main(args, ctx=None):
         )
 
     schema = (data.get("schema") or "").strip()
-    params = data.get("params")
     confirm_destructive = bool(data.get("confirm_destructive"))
     notices = []
 
@@ -425,12 +424,7 @@ def main(args, ctx=None):
                     return _fail_msg("BadRequest", "Invalid schema name: %r" % (schema,))
                 cur.execute('SET LOCAL search_path TO "%s"' % schema)
 
-            if params is None:
-                cur.execute(sql)
-            else:
-                if not isinstance(params, list):
-                    return _fail_msg("BadRequest", "'params' must be a list")
-                cur.execute(sql, params)
+            cur.execute(sql)
 
             duration = int((time.time() - start) * 1000)
 

@@ -8,7 +8,6 @@ import { SchemaProvider } from "@/lib/schema-context";
 import Overview from "./pages/Overview";
 import Explorer from "./pages/Explorer";
 import Console from "./pages/Console";
-import Databases from "./pages/Databases";
 import Schemas from "./pages/Schemas";
 import Tables from "./pages/Tables";
 import Views from "./pages/Views";
@@ -18,10 +17,8 @@ import Constraints from "./pages/Constraints";
 import Sequences from "./pages/Sequences";
 import Functions from "./pages/Functions";
 import Queries from "./pages/Queries";
-import Parameterized from "./pages/Parameterized";
 import Transactions from "./pages/Transactions";
 import Explain from "./pages/Explain";
-import Activity from "./pages/Activity";
 import Examples from "./pages/Examples";
 import NotFound from "./pages/NotFound";
 
@@ -40,7 +37,6 @@ const App = () => (
               <Route path="/overview" element={<Overview />} />
               <Route path="/explorer" element={<Explorer />} />
               <Route path="/console" element={<Console />} />
-              <Route path="/databases" element={<Databases />} />
               <Route path="/schemas" element={<Schemas />} />
               <Route path="/tables" element={<Tables />} />
               <Route path="/views" element={<Views />} />
@@ -50,10 +46,8 @@ const App = () => (
               <Route path="/sequences" element={<Sequences />} />
               <Route path="/functions" element={<Functions />} />
               <Route path="/queries" element={<Queries />} />
-              <Route path="/params" element={<Parameterized />} />
               <Route path="/transactions" element={<Transactions />} />
               <Route path="/explain" element={<Explain />} />
-              <Route path="/activity" element={<Activity />} />
               <Route path="/examples" element={<Examples />} />
               {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
               <Route path="*" element={<NotFound />} />
