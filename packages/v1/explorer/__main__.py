@@ -6,7 +6,7 @@ import types, os, explorer
 
 builder = []
 ## build-context ##
-#--param POSTGRES_URL "$POSTGRES_URL"
+#--param EXT_POSTGRES_URL "$EXT_POSTGRES_URL"
 import psycopg
 def init_postgresql(args, ctx):
   dburl = args.get("EXT_POSTGRES_URL", os.getenv("EXT_POSTGRES_URL"))
